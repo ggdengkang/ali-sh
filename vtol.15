@@ -1,0 +1,687 @@
+#!/bin/bash
+# author : Yiming
+
+: <<'COMMENT'
+目前仅适用于centos
+
+确保脚本文件有可执行权限
+chmod +x vtol
+
+当前功能：
+
+1.查看文件中的制表符和空格
+    ./vtol cb sn2hosts
+
+2.一键配置永久IP
+    ./vtol ap [网卡名称]  [IP地址]  [掩码]
+
+    例：
+        ./vtol ap ens33 10.120.8.200 255.255.255.0
+
+3.一键安装本地yum源,如果是外部存储需要先正确挂载到文件系统
+    ./vtol cy [仓库名称]  [仓库地址]
+
+    例：
+        ./vtol cy 1 file:///mnt/
+
+4.在初始系统环境下一键安装ngis环境依赖,必须先正确配置yum源
+    ./vtol aly
+
+5.生成阿里标准DNS模板到文件
+	./vtol adns [DNS地址] [要输出的DNS文件路径]
+
+	例：
+		./vtol adns 8.8.8.8 /home/ngis/nfs/resolv.conf
+
+6.一键启动阿里PXE环境,需要先正确上传ngis到服务器
+	./vtol aint [节点编号] [业务网段] [母机地址] [DNS地址]
+
+	例：
+		./vtol aint cn111 1.1.1.0/24 1.1.1.100 8.8.8.8
+	
+	将自动安装并启动阿里环境,自动配置正确DNS模板
+
+7.检测远程BMC地址是否可用
+	./vtol cbm [IP地址]
+
+	例：
+		./vtol cbm 10.120.8.1
+
+8.一键配置ssh免密登录密钥,配置后可免密登录其他服务器
+	./vtol ash
+
+9.关闭防火墙并永久禁用
+	./vtol dfl
+
+10.查看网卡速率
+	./vtol asp [网卡名称]
+
+	例：
+		./vtol asp ens33
+
+11.离线环境下尝试全自动解决依赖、部署环境(需要先挂载U盘到/mnt路径,并且正确上传ngis)
+	确保网卡是UP的(使用命令 'ip a' 查看),会自动搜索万兆、千兆网卡并进行IP配置
+	./vtol aintb [节点编号] [业务网段] [母机地址] [母机掩码] [千兆网卡地址] [DNS地址]
+
+		例：
+			./vtol aintb cn111 1.1.1.0/24 1.1.1.100 255.255.255.0 10.120.8.200 8.8.8.8
+
+12.探测所有可达的管理地址并获取对应SN
+	./vtol ac
+
+13.探测sn2hosts文件中所有服务器管理地址并获取对应SN,不可达的IP会提示错误
+	./vtol sac
+
+14.一键配置eth2地址,只用于配置eth2带外网卡,重启服务器生效
+	./vtol eth2 网卡名称 [网卡IP] [掩码]
+
+		例: 将网卡enp4s0f0配置为带外网卡
+			./vtol eth2 enp4s0f0 10.120.8.248 255.255.255.0
+
+15.将本地hosts文件复制到节点所有服务器中,失败的服务器会有提示
+	./vtol ahs
+
+16.将此merge的sn2hosts文件同步到节点所有的merge服务器中,失败的服务器会有提示
+	./vtol asn2
+
+17.将sn2hosts文件内的管理地址配置到sn2hosts文件内对应的服务器中
+	./vtol ssbm
+
+18.测试/etc/hosts文件中所有服务器的连通性
+	./vtol tip
+COMMENT
+
+function httpcheck () {
+	systemctl status httpd &> /dev/null
+	if [ $? -eq 0 ]; then
+		echo -e "\033[0;32mHTTP is ok!\033[0m"
+		exit 0
+	fi
+	grep "Listen 8888" /etc/httpd/conf/httpd.conf &> /dev/null
+	if [ $? -eq 0 ]; then
+		:
+	else
+		sed -i '/Listen/d' /etc/httpd/conf/httpd.conf
+		sed -i '/^ServerRoot/ a\Listen 8888' /etc/httpd/conf/httpd.conf
+		systemctl start httpd &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mHTTP is ok!\033[0m"
+			exit 0
+		fi
+	fi
+	ipins=`rpm -qa lsof`
+	if [ $? -eq 0 ];then 
+		yum install -y lsof &> /dev/null
+		if [ $? -eq 0 ]; then
+			bindport=`lsof -i :8888 | grep -v PID |awk '{print $2}'`
+			for i in $bindport;do kill -9 $i &> /dev/null;done
+			systemctl restart httpd
+			if [ $? -eq 0 ]; then
+				echo -e "\033[0;32mHTTP is ok!\033[0m"
+				exit 0
+			else
+				echo "HTTP repair failed"
+				exit 1
+			fi
+		else
+			echo "HTTP repair failed"
+			exit 1
+		fi
+	else
+		echo "If the dependency fails to be resolved automatically, install lsof manually"
+		exit 1
+	fi
+}
+
+
+case $1 in
+	test)
+		httpcheck $1
+		;;
+	cb)
+		if [ -z $2 ]; then
+			echo "Need a file name"
+			exit 0
+		fi
+		if [ -f $2 ]; then
+			sed 's/\t/\o033[1;31m[tab]\o033[0m/g;s/ /\o033[1;33m[ ]\o033[0m/g;/^$/s//\o033[1;33m[Enter]\o033[0m/' $2
+		else
+			echo "no file"
+		fi
+		;;
+	ap)
+		if [ -z $2 ]; then
+			echo "Need a network name"
+			exit 0
+		fi
+		if [ -z $3 ]; then
+			echo "No IP address is specified"
+			exit 0
+		fi
+		if [ -z $4 ]; then
+			echo "No mask is specified"
+			exit 0
+		fi
+		if `ip a | grep -q $2`; then
+			netfile='/etc/sysconfig/network-scripts/ifcfg-'$2
+			if [ -f ${netfile} ]; then
+				echo "Network adapter configuration file detected"
+				if `grep -q IPADDR ${netfile}`; then
+					sed -i "s/^IPADDR=.*/IPADDR=$3/g" ${netfile}
+				else
+					echo "IPADDR="$3 >> ${netfile}
+				fi
+				if `grep -q PREFIX ${netfile}`; then
+					sed -i "s/^PREFIX=.*/PREFIX=$4/g" ${netfile}
+				else
+					echo "PREFIX="$4 >> ${netfile}
+				fi
+				if `grep -q GATEWAY ${netfile}`; then
+					sed -i "s/^GATEWAY=.*/GATEWAY=$5/g" ${netfile}
+				else
+					echo "GATEWAY="$5 >> ${netfile}
+				fi
+				if `grep -q ONBOOT ${netfile}`; then
+					sed -i "s/^ONBOOT=.*/ONBOOT=yes/g" ${netfile}
+				else
+					echo "ONBOOT=yes" >> ${netfile}
+				fi
+				if `grep -q BOOTPROTO ${netfile}`; then
+					sed -i "s/^BOOTPROTO=.*/BOOTPROTO=static/g" ${netfile}
+				else
+					echo "BOOTPROTO=static" >> ${netfile}
+				fi
+			else
+				echo "NAME="$2 >> ${netfile}
+				echo "DEVICE="$2 >> ${netfile}
+				echo "IPADDR="$3 >> ${netfile}
+				echo "PREFIX="$4 >> ${netfile}
+				echo "GATEWAY="$5 >> ${netfile}
+				echo "ONBOOT=yes" >> ${netfile}
+				echo "BOOTPROTO=static" >> ${netfile}
+			fi
+			echo "Configuration complete"
+			echo "Restart network service"
+			/etc/init.d/network restart && exit 0
+		else
+			echo $2"No NIC detected"
+		fi
+		;;
+	cy)
+		if [ -z $2 ]; then
+			echo "No yum name is specified"
+			exit 0
+		fi
+		if [ -z $3 ]; then
+			echo "No yum repository address is specified"
+			cat << EOF
+
+Source address example
+
+	local path: file://[path]
+		example: file:///mnt/
+
+	http path: http://[path]
+		example: http://mirrolist.centos.org/
+
+	ftp path: ftp://[path]
+		example: ftp://ftp.yum.org/
+
+EOF
+			exit 0
+		fi
+		rm -rf /etc/yum.repos.d/*.repo
+		echo -e "[$2]\nname=$2\nenabled=1\ngpgcheck=0\nbaseurl=$3" > /etc/yum.repos.d/$2.repo
+		yum clean all
+		yum makecache
+		echo "Configuration complete"
+		exit 0
+		;;
+	aly)
+		yum install -y apr-util nfs-utils rpcbind xinetd httpd
+		systemctl stop firewalld
+		setenforce 0
+		echo "Config is ok!"
+		;;
+	adns)
+		if [ -z $2 ]; then
+			echo "Enter the dns server address"
+			exit 0
+		fi
+		if [ -z $3 ]; then
+			echo "Enter dns file"
+			exit 0
+		fi
+		echo -e "nameserver $2\nnameserver 223.5.5.5\nnameserver 114.114.114.114\nnameserver 223.6.6.6" > $3
+		echo "Config is ok!"
+		;;
+	aint)
+		if [ -d /home/ngis ]; then
+			:
+		else
+			echo "The /home/ngis path was not detected"
+			exit 0
+		fi
+		if [ -f /home/ngis/install.sh ]; then
+			:
+		else
+			echo "The install.sh script was not detected"
+			exit 0
+		fi
+		if [ -z $2 ]; then
+			echo "Enter node number"
+			exit 0
+		fi
+		if [ -z $3 ]; then
+			echo "Enter a service network segment"
+			exit 0
+		fi
+		if [ -z $4 ]; then
+			echo "Enter the host address"
+			exit 0
+		fi
+		if [ -z $5 ]; then
+			echo "Enter the DNS server address"
+			exit 0
+		fi
+		sh /home/ngis/install.sh << EOF
+$2
+$3
+$4
+$5
+
+EOF
+		echo -e "nameserver $5\nnameserver 223.5.5.5\nnameserver 114.114.114.114\nnameserver 223.6.6.6" > /home/ngis/nfs/resolv.conf
+		# Detecting DHCP Services
+		systemctl status dhcpd &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mDHCP is ok!\033[0m"
+		else
+			systemctl status httpd &> /dev/null
+			if [ $? -eq 0 ]; then
+				systemctl restart dhcpd &> /dev/null
+				if [ $? -eq 0 ]; then
+					echo -e "\033[0;32mDHCP is ok!\033[0m"
+				else
+					echo "DHCP is filed!"
+				fi
+			else
+				httpcheck
+				if [ $? -eq 0 ]; then
+					systemctl restart dhcpd
+					if [ $? -eq 0 ]; then
+						echo -e "\033[0;32mDHCP is ok!\033[0m"
+					else
+						echo "DHCP is filed!"
+					fi
+				fi
+			fi
+		fi
+		# Detecting HTTP Services
+		systemctl status httpd &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mHTTP is ok!\033[0m"
+		else
+			httpcheck
+		fi
+		# Detecting Xinetd Services
+		systemctl status xinetd &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mXinetd is ok!\033[0m"
+		else
+			echo "xinetd repair failed"
+		fi
+		# Detecting Rpcbind Services
+		systemctl status rpcbind &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mrpcbind is ok!\033[0m"
+		else
+			echo "rpcbind repair failed"
+		fi
+		# Detecting nfs Services
+		systemctl status nfs &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo -e "\033[0;32mnfs is ok!\033[0m"
+		else
+			echo "nfs repair failed"
+		fi
+		echo -e "All in success!"
+		;;
+	cbm)
+		ipins=`rpm -qa ipmitool`
+		# Check the pimitool package
+		if [ -z $ipins ];then 
+			# Try yum to install ipmi
+			yum install -y ipmitool &> /dev/null
+			if [ $? -eq 0 ]; then
+				:
+			else
+				echo "If the dependency fails to be resolved automatically, install ipmitool manually"
+				exit 1
+			fi
+		fi
+		# Check
+		if [ -z $2 ];then
+			echo "Specify the remote BMC address"
+			exit 1
+		fi
+		ipmitool -I lanplus -H $2 -U taobao -P 9ijn0okm power status &> /dev/null
+		if [ $? -eq 0 ]; then
+			echo "$2 bmc is ok!"
+			exit 0
+		else
+			ipmitool -I lan -H $2 -U taobao -P 9ijn0okm power status &> /dev/null
+			if [ $? -eq 0 ]; then
+				echo "$2 bmc is ok!"
+				exit 0
+			else
+				echo "$2 bmc error."
+				exit 1
+			fi
+		fi
+		;;
+	ash)
+		if [ `whoami` == 'root' ]; then
+			home=/root/.ssh/
+		else
+			home=/home/`whoami`/.ssh/
+		fi
+		if [ -d ${home} ]; then
+			:
+		else
+			mkdir -p ${home}
+		fi
+		echo "-----BEGIN RSA PRIVATE KEY-----
+MIIEoQIBAAKCAQEAnFWePthCFuzxfUs0GM8KoFMOME4rRMMkQw/Br6YBmHIAL/yH
+QNMHqufTmHftnHASXei63KarQhj+WUmIL4fhRpM3A1VJWm0TTIG8lVP66ascb7kX
+pi3x3OcgJg73kX70qlJyrlae0W2C3pT/k48udJSTLMGcbpxsFOdQSldeaKOT1eBs
+LXsXV78hFFmjUfAtUN6EjByr2Rqfd1zLt+ocnJzDdcTAFzkmovNHY5N34udbFQv9
+RiNimdV8LJKHbVGnmQjN2AeesBnrfERjQ+i+wSO0UHoI1sf/2ZdpPoKbQaAb/S4D
+ACmTGvGkCxL1pj/b7siPFQEESV97qTyUYYhRiQIBIwKCAQEAgYjE8j4oIZ/AxuaK
+QHEIzfusq657n1/cN5C2bPdDJopX7T7zuV5lcFmvUnH/ZFzcBKrj+KdasxwF8jWc
+uasZviI05YEuJlpgcpdhvY659M+bN//DI0qj1Ep5uSJYGXfSCXeDl8QdMS7aJiOv
+MR7dWUfnqL2tgDh2z33Uz+H9xGj7i/SKboV876K1Kvh2ibuyIB3aQnMukQ7+5NZC
+H+imDOjYUY5LtUuAeYwPBP1WK04ZDXrJYZxk/N4Cvb4qhUa+ddLlc+pCd2pmHnof
+9gLWP+BnE8Z9i9dwSpcSg0fo57CB0TbW4FQdk81IuBCqzf4G6jBZZQg04w5QXBmv
+VirNdwKBgQDPmj95bSIdA6/IFbLFdZWfh5Ykrr049ACv7EYdif87Gtc1LObZzUVa
+ph3BtMTNLh3wN2IagKcVek33rSa1UAEHGmH3erEjmxjseqiGYQupvO5Po1sRi3xV
+I9g4JwQ22aDV2LVmK1tCEZsPVrxHzP9xm18ntF4pCAdrFGawjykwvwKBgQDAx67H
+Q8mG2pGY055OzDFnW+aNad1DhXqYmjdnM4t6NGXqUF5NH7MoGrDmUIJu2MxDzWUk
+sMhge5YObkiEUFOFqdRx/ZQHjbWMljSb1G+6Kd/xGar+q1lPUuWNgeD73Z0BvgpK
+DK9rIf24hr4mU2YbXBSRjmzQZEbKFAZW1E7HtwKBgGTV5FDr3V6MwxgKiggjK2q+
+Mvvf2EA8AFVywvhnmTn3GBKDhhIEngd1Qac6i3maDoqejrxqX8iafaQvh9RosArD
+q+07l94YIgx2F1c2c2ESn6MGM4wtzq0CyBtGJp5McrEC28PpLFNKYUH27bx5g2MQ
+87QzCSnfVA9wTyKOrZtVAoGAfq8bFTssqRNJvDNKxhEnx5QpyqSnWEHFl3tI+qzX
+/9lKSYVFSJ/NgMEVKaKe2yDAvtduWfCDrR4DhdNxe4U+M0O3fhuqa10fiEVzB1EW
+OIHq7uT7VuWhFt60Gyl2luIWuACKayzoTbdAVLBREd8IlaLo8e/hGzqU6zG7Bdv5
+QWkCgYAysksqDV4tFnWRjgQWsC6jxvaNdrll+o6/XRLeIncIVMOQB+SEOp+S9wid
+B+WsuwkboZG8mRm50d5Rh6X+aAmlWKoBfWX2FchyZMmkG8RhDtTq2eDkNpipmpXU
+TlDZk80tKT3td0aAj3anOmdcv2zfV5/yjDcWjeXiAcyTAbWZoA==
+-----END RSA PRIVATE KEY-----" > ${home}id_rsa
+		chmod 600 ${home}id_rsa
+		echo -e "\033[0;32mconfig is ok!\033[0m"
+		;;
+	dfl)
+		setenforce 0
+		sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+		systemctl stop firewalld
+		systemctl disable firewalld
+		;;
+	asp)
+		# Check
+		if [ -z $2 ];then
+			echo "Enter the NIC name"
+			exit 1
+		fi
+		if `ip a | grep -q $2`; then
+			ethtool $2 | awk '/Speed:/ {print $2}'
+		else
+			echo "The NIC does not exist."
+		fi
+		;;
+	aintb)
+		ethtool -s ens38 speed 100 duplex full
+		allNic=`ip link show | awk -F': ' '{print $2}' | egrep -v '(^$|lo)'`
+		eth0=''
+		eth2=''
+		for nic in ${allNic}
+		do
+			nicspeed=`sh $0 asp $nic`
+			if [ ${nicspeed} == "10000Mb/s" || ${nicspeed} == "25000Mb/s" || ${nicspeed} == "20000Mb/s"|| ${nicspeed} == "50000Mb/s"]; then
+				if [ -z $eth0 ]; then
+					eth0=$nic
+					sh $0 ap $eth0 $4 $5
+				fi
+			fi
+			if [ ${nicspeed} == "1000Mb/s" || ${nicspeed} == "100Mb/s"]; then
+				if [ -z $eth2 ]; then
+					eth2=$nic
+					sh $0 ap $eth2 $6 255.255.255.0
+				fi
+			fi
+		done
+		sh $0 cy 1 file:///mnt/
+		sh $0 aly
+		sh $0 ash
+		sh $0 aint $2 $3 $4 $5 $7
+		;;
+	ac)
+		ipins=`rpm -qa ipmitool`
+		# Check the pimitool package
+		if [ -z $ipins ];then 
+			# Try yum to install ipmi
+			yum install -y ipmitool &> /dev/null
+			if [ $? -eq 0 ]; then
+				:
+			else
+				echo "If the dependency fails to be resolved automatically, install ipmitool manually"
+				exit 1
+			fi
+		fi
+		for i in {1..246}
+		do
+			if [ $i -eq 211 ] || [ $i -eq 212 ]; then
+				:
+			else
+				ping -c 1 -w 1 10.120.8.$i &> /dev/null
+				if [ $? -eq 0 ]; then
+					SN=`ipmitool -I lanplus -U taobao -P 9ijn0okm -H 10.120.8.$i fru print 0 | grep "Product Serial"`
+					if [ $? -eq 0 ]; then
+						echo -e 10.120.8.$i"\t"$SN
+					else
+						SN=`ipmitool -I lan -U taobao -P 9ijn0okm -H 10.120.8.$i fru print 0 | grep "Product Serial"`
+						if [ $? -eq 0 ]; then
+							echo -e 10.120.8.$i"\t"$SN
+						else
+							echo -e 10.120.8.$i"\tnull"
+						fi
+					fi
+				fi
+			fi
+		done
+		;;
+	sac)
+		ipins=`rpm -qa ipmitool`
+		# Check the pimitool package
+		if [ -z $ipins ];then 
+			# Try yum to install ipmi
+			yum install -y ipmitool &> /dev/null
+			if [ $? -eq 0 ]; then
+				:
+			else
+				echo "If the dependency fails to be resolved automatically, install ipmitool manually"
+				exit 1
+			fi
+		fi
+		if [ -f /home/ngis/nfs/sn2hosts ];then
+			for i in `awk '{print $8}' /home/ngis/nfs/sn2hosts`
+			do
+				ping -c 1 -w 1 $i &> /dev/null
+				if [ $? -eq 0 ]; then
+					SN=`ipmitool -I lanplus -U taobao -P 9ijn0okm -H $i fru print 0 | grep "Product Serial"` &> /dev/null
+					if [ $? -eq 0 ]; then
+						echo -e $i"\t"$SN
+					else
+						SN=`ipmitool -I lan -U taobao -P 9ijn0okm -H $i fru print 0 | grep "Product Serial"` &> /dev/null
+						if [ $? -eq 0 ]; then
+							echo -e $i"\t"$SN
+						else
+							echo -e .$i"\tnull"
+						fi
+					fi
+				else
+					echo "ping $i is filed"
+				fi
+			done
+		else
+			echo "The sn2hosts file was not detected"
+		fi
+		;;
+	ssbm)
+		if [ -f /home/ngis/nfs/sn2hosts ];then
+			for i in `awk '{print $8}' /home/ngis/nfs/sn2hosts`
+			do
+				host=`grep $i /home/ngis/nfs/sn2hosts | awk '{print $2}'`
+				echo `ssh ${host} 'ipmitool -I open lan set 1 ipsrc static' &> /dev/null &
+					ssh ${host} "ipmitool -I open lan set 1 ipaddr $i" &> /dev/null &
+					ssh ${host} 'ipmitool -I open lan set 1 netmask 255.255.255.0' &> /dev/null &
+				if [ $? -eq 0 ]; then
+					echo -e ${host}"set bmc is ok"
+				else
+					echo -e ${host}"set bmc is failed"
+				fi`
+			done
+		else
+			echo "The sn2hosts file was not detected"
+		fi
+		;;
+	eth2)
+		if [ -z $2 ]; then
+			echo "Enter the NIC name"
+			exit 1
+		fi
+		if [ -z $3 ]; then
+			echo "Enter the Address"
+			exit 1
+		fi
+		if [ -z $4 ]; then
+			echo "Enter the mask"
+			exit 1
+		fi
+		Nicinfo=`ip link show $2 | grep ether` &> /dev/null
+		if [ $? -eq 0 ]; then
+			if [ -f /etc/sysconfig/network-scripts/ifcfg-eth2 ]; then
+				rm -f /etc/sysconfig/network-scripts/ifcfg-eth2
+			fi
+			echo -e "DEVICE=eth2
+NAME=eth2
+DEFROUTE=no
+ONBOOT=yes
+HWADDR=`echo $Nicinfo | awk '/ether/ {print $2}'`
+IPADDR=$3
+NETMASK=$4" >> /etc/sysconfig/network-scripts/ifcfg-eth2
+		fi
+		echo "config is ok"
+		echo "restart the server."
+		;;
+	ahs)
+		if [ -f /etc/hosts ];then
+			for i in `awk '!/^#/ && /cn/ {print $1}' /etc/hosts`
+			do
+				scp -o ConnectTimeout=2 /etc/hosts root@$i:/etc/ &> /dev/null
+				if [ $? -eq 0 ]; then
+					echo -e "\033[0;32m$i is ok\033[0m"
+				else
+					echo "$i is filed"
+				fi
+			done
+		else
+			echo "The hosts file was not detected"
+		fi
+		;;
+	asn2)
+		if [ -f /home/ngis/nfs/sn2hosts ];then
+			for i in `awk '!/^#/ && /cn/ && /merge/ {print $1}' /etc/hosts`
+			do
+				scp -o ConnectTimeout=2 /home/ngis/nfs/sn2hosts root@$i:/home/ngis/nfs/ &> /dev/null
+				if [ $? -eq 0 ]; then
+					echo -e "\033[0;32m$i is ok\033[0m"
+				else
+					echo "$i is filed"
+				fi
+			done
+		else
+			echo "The hosts file was not detected"
+		fi
+		;;
+	tip)
+		for i in `awk '/cn/ && !/^#/ {print $1}' /etc/hosts`
+		do
+			ping -w 3 $i >> /dev/null && echo $i is ok || echo $i is no
+		done
+		;;
+	*)
+		cat << EOF
+
+./vtol [options] [params]
+
+options:
+
+	cb,	Explicitly outputs Spaces and tabs in a file
+		./vtol cb [filename]
+	
+	ap,	Configure a permanent IP address for the NIC
+		./vtol ap [Nic name] [Address] [NETMASK]
+	
+	cy,	Custom yum warehouse
+		./vtol cy [name] [baseurl]
+	
+	aly,	Install ngis environment dependencies with one click in the initial system environment
+		./vtol aly
+	
+	adns,	Automatically configures correct Ali dns templates to files
+		./vtol adns [address] [filename]
+	
+	aint,	One click to start Ali PXE environment
+		./vtol aint [node] [network address] [host] [dns]
+	
+	cbm,	Test whether the remote bmc address is available
+		./vtol cbm [host]
+	
+	ash,	SSH without password
+		./vtol ash
+
+	dfl,	Disable the firewall and permanently disable it
+		./vtol dfl
+
+	asp,	Viewing the NIC Rate
+		./vtol asp [Nic name]
+	
+	aintb,	In an offline environment, if you attempt to automatically solve the dependency and deployment environment 
+			(mount the USB flash drive to the /mnt path and upload ngis correctly)
+			the system automatically searches for the 10 Gbit/s network adapter and performs IP configuration
+		./vtol aintb [node] [network address] [host] [netmask] [Gigabit NIC address] [dns]
+	
+	ac,	Detect all reachable management addresses and obtain the corresponding SN
+		./vtol ac
+	
+	sac,	Check the management addresses of all servers in the sn2hosts file and obtain the corresponding SN
+		./vtol sac
+	
+	eth2,	The one-click eth2 address configuration is only used to configure the eth2 out-of-band NIC. Restarting the server takes effect
+		./vtol eth2 [Nic name] [address] [mask]
+	
+	ahs,	Copy the local hosts file to all servers on the node
+		./vtol ahs
+	
+	asn2,	Synchronize this merge's sn2hosts file to all merge servers on the node
+		./vtol asn2
+
+	ssbm,	Configure the management address in the sn2hosts file to the corresponding server in the sn2hosts file
+		./vtol ssbm
+	
+	tip,	Test the connectivity of all servers in the /etc/hosts file
+		./vtol tip
+EOF
+		;;
+esac
